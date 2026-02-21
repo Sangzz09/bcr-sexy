@@ -1,9 +1,9 @@
 {
-  "name": "server",
+  "name": "baccarat-api",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "baccarat-api.js",
   "scripts": {
-    "start": "server.js"
+    "start": "node baccarat-api.js"
   },
   "dependencies": {
     "node-fetch": "^2.7.0"
