@@ -161,31 +161,22 @@ function checkTieCycle(raw) {
 }
 
 // ============================================
-// NORMALIZE: ép rawScore (0-100+) về dải 60-90%
-// Dùng sigmoid-like để phân bố đều, tránh dồn cục
+// NORMALIZE
 // ============================================
 function normalize(rawScore) {
-  // rawScore thường nằm 50-100, map về 60-90
   const MIN_OUT = 60, MAX_OUT = 90;
-  // Clamp input về 40-100 trước
   const clamped = Math.max(40, Math.min(100, rawScore));
-  // Linear map: 40→60, 100→90
   const mapped = MIN_OUT + ((clamped - 40) / (100 - 40)) * (MAX_OUT - MIN_OUT);
   return Math.round(mapped);
 }
 
 // ============================================
-// ANALYZE - KẾT HỢP CẢ HAI NGUỒN
-// oldData : item từ API cũ (có .results chuỗi, .good_road)
-// newData : item từ API mới (có .last_5, .stats_55, .recommended_bet, .bet_info)
+// ANALYZE
 // ============================================
 function analyze(oldData, newData) {
   let voteB = 0, voteP = 0;
   let beb = null, sr = null, cr = null;
 
-  // ══════════════════════════════════════════
-  // PHẦN 1: TỪ API CŨ (derived roads + pattern)
-  // ══════════════════════════════════════════
   const raw = oldData
     ? (oldData.results || '').toUpperCase().replace(/[^BPT]/g, '')
     : '';
@@ -208,7 +199,6 @@ function analyze(oldData, newData) {
         else break;
       }
 
-      // Derived Roads  (w: 3.0 / 2.5 / 2.0)
       beb = predictFromDerived(cols, 1);
       sr  = predictFromDerived(cols, 2);
       cr  = predictFromDerived(cols, 3);
@@ -216,7 +206,6 @@ function analyze(oldData, newData) {
       if (sr  === 'B') voteB += 2.5; else if (sr  === 'P') voteP += 2.5;
       if (cr  === 'B') voteB += 2.0; else if (cr  === 'P') voteP += 2.0;
 
-      // Big Road Pattern
       const pattern = detectBigRoadPattern(cols);
       if ((pattern.score.tiepTuc || 0) > 0) {
         if (curSide === 'B') voteB += pattern.score.tiepTuc;
@@ -227,7 +216,6 @@ function analyze(oldData, newData) {
         else voteP += pattern.score.daoChieu;
       }
 
-      // Tỉ lệ 20 ván
       const nonTieArr = nonTie;
       const r20  = nonTieArr.slice(-20);
       const r20B = r20.filter(x => x === 'B').length;
@@ -236,36 +224,28 @@ function analyze(oldData, newData) {
       if (ratio > 0.62) voteB += 1.5;
       else if (ratio < 0.38) voteP += 1.5;
 
-      // Shoe position
       const shoe = shoeBonus(raw, ratio);
       voteB += shoe.bB;
       voteP += shoe.bP;
 
-      // Tie cycle
       const tieVote = checkTieCycle(raw);
       if (tieVote > 0 && tieVote > voteB && tieVote > voteP) {
-        // Trả thẳng Hòa nếu tín hiệu đủ mạnh
         const rawConf = (tieVote / (voteB + voteP + tieVote + 0.01)) * 100;
         return { dudoan: 'Hòa', ti_le: normalize(rawConf) };
       }
 
-      // Good road từ API cũ
       const gr = (oldData.good_road || '').toString();
       if (gr.includes('Cái') || gr.includes('Banker')) voteB += 1.5;
       if (gr.includes('Con')  || gr.includes('Player')) voteP += 1.5;
     }
   }
 
-  // ══════════════════════════════════════════
-  // PHẦN 2: TỪ API MỚI (stats + crowd + rec)
-  // ══════════════════════════════════════════
   if (newData) {
     const last5   = newData.last_5   || [];
     const stats   = newData.stats_55 || {};
     const recBet  = (newData.recommended_bet || '').toUpperCase();
     const betInfo = newData.bet_info || [];
 
-    // Momentum last_5
     const l5results = last5.map(x => {
       const w = (x.winner || '').toLowerCase();
       if (w === 'banker') return 'B';
@@ -277,13 +257,11 @@ function analyze(oldData, newData) {
     if (l5B > l5P) voteB += (l5B - l5P) * 0.6;
     else if (l5P > l5B) voteP += (l5P - l5B) * 0.6;
 
-    // Nếu API cũ không có data → dùng streak từ last_5
     if (!curSide && last5.length > 0) {
       const l5Side = l5results.filter(x => x !== 'T');
       curSide = l5Side[l5Side.length - 1] || null;
     }
 
-    // Tỉ lệ stats_55
     const total55 = (stats.banker || 0) + (stats.player || 0);
     if (total55 > 0) {
       const ratio55 = (stats.banker || 0) / total55;
@@ -293,13 +271,11 @@ function analyze(oldData, newData) {
       else if (ratio55 < 0.45) voteP += 0.6;
     }
 
-    // Recommended bet từ API mới  (w: 2.0)
     if (recBet.includes('BANKER')) voteB += 2.0;
     else if (recBet.includes('PLAYER')) voteP += 2.0;
     if (recBet.includes('THEO') && curSide === 'B') voteB += 1.2;
     else if (recBet.includes('THEO') && curSide === 'P') voteP += 1.2;
 
-    // Crowd signal bet_info  (w: 1.0)
     const bankerBet = betInfo.find(x => x.type === 'Banker');
     const playerBet = betInfo.find(x => x.type === 'Player');
     if (bankerBet && playerBet) {
@@ -312,18 +288,15 @@ function analyze(oldData, newData) {
     }
   }
 
-  // ══════════════════════════════════════════
-  // QUYẾT ĐỊNH CUỐI
-  // ══════════════════════════════════════════
   if (voteB === 0 && voteP === 0) return { dudoan: 'Chua du du lieu', ti_le: 0 };
 
   const MAX_STREAK = 4;
   const tenViet    = { B: 'Cái', P: 'Con' };
   let pred;
-  let rawScore; // điểm thô trước khi normalize
+  let rawScore;
 
   if (streak >= MAX_STREAK && curSide === 'B' && voteB >= voteP) {
-    pred = 'P'; rawScore = 50; // đảo chiều → độ tin cậy thấp vừa
+    pred = 'P'; rawScore = 50;
   } else if (streak >= MAX_STREAK && curSide === 'P' && voteP >= voteB) {
     pred = 'B'; rawScore = 50;
   } else {
@@ -331,7 +304,6 @@ function analyze(oldData, newData) {
     const total = voteB + voteP + 0.01;
     rawScore = (Math.max(voteB, voteP) / total) * 100;
 
-    // Boost khi derived roads đồng thuận
     const agree = [beb, sr, cr].filter(x => x === pred).length;
     if (agree === 3) rawScore += 12;
     else if (agree === 2) rawScore += 6;
@@ -342,22 +314,27 @@ function analyze(oldData, newData) {
 
 // ============================================
 // FETCH HELPERS
+// ─ FIX 1: timeout 3s thay vì 8s
+// ─ FIX 2: retry 1 lần nếu lần đầu fail/timeout
 // ============================================
-async function safeFetch(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    clearTimeout(timer);
-    return null;
+async function safeFetch(url, timeout = 3000, retry = 1) {
+  for (let attempt = 0; attempt <= retry; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      return await res.json();
+    } catch {
+      clearTimeout(timer);
+      // nếu còn lượt retry thì thử lại ngay
+    }
   }
+  return null;
 }
 
 // ============================================
@@ -368,17 +345,19 @@ let lastFetch = 0;
 
 async function fetchAndCache() {
   try {
-    // Fetch API cũ (1 request trả toàn bộ bàn)
-    const oldJson = await safeFetch(API_OLD);
-    const oldMap  = {};
+    // ─ FIX 3: fetch API cũ và toàn bộ API mới SONG SONG cùng lúc
+    const [oldJson, ...newResults] = await Promise.all([
+      safeFetch(API_OLD),
+      ...BAN_IDS.map(id => safeFetch(`${API_NEW}/${id}`)),
+    ]);
+
+    const oldMap = {};
     if (oldJson && oldJson.code === 200 && Array.isArray(oldJson.data)) {
       for (const item of oldJson.data) {
         if (item.ban) oldMap[String(item.ban).trim()] = item;
       }
     }
 
-    // Fetch API mới (song song tất cả bàn)
-    const newResults = await Promise.all(BAN_IDS.map(id => safeFetch(`${API_NEW}/${id}`)));
     const newMap = {};
     for (let i = 0; i < BAN_IDS.length; i++) {
       const d = newResults[i];
@@ -386,7 +365,6 @@ async function fetchAndCache() {
       else if (d) newMap[BAN_IDS[i]] = d;
     }
 
-    // Gộp: lấy union tất cả bàn có ít nhất 1 nguồn
     const allBans = new Set([...Object.keys(oldMap), ...Object.keys(newMap)]);
     const banList = [];
 
@@ -394,9 +372,7 @@ async function fetchAndCache() {
       const oldData = oldMap[ban] || null;
       const newData = newMap[ban] || null;
 
-      // Bỏ qua nếu cả 2 không có gì
       if (!oldData && !newData) continue;
-      // Bỏ qua nếu API mới có nhưng không có last_5
       if (newData && (!newData.last_5 || newData.last_5.length === 0) && !oldData) continue;
 
       const a = analyze(oldData, newData);
@@ -410,7 +386,6 @@ async function fetchAndCache() {
       });
     }
 
-    // Sắp xếp theo tên bàn
     banList.sort((a, b) => String(a.ban).localeCompare(String(b.ban), undefined, { numeric: true }));
 
     cache     = banList;
@@ -421,9 +396,14 @@ async function fetchAndCache() {
   }
 }
 
+// ─ FIX 4: pipeline — bắt đầu fetch chu kỳ kế tiếp ngay sau khi fetch xong,
+//   không chờ đủ INTERVAL kể từ lúc bắt đầu
 async function loop() {
+  const t0 = Date.now();
   await fetchAndCache();
-  setTimeout(loop, INTERVAL);
+  const elapsed = Date.now() - t0;
+  const wait    = Math.max(0, INTERVAL - elapsed); // trừ đi thời gian đã fetch
+  setTimeout(loop, wait);
 }
 
 // ============================================
