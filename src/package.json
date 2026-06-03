@@ -1,14 +1,17 @@
 {
-  "name": "baccarat-api",
-  "version": "1.0.0",
-  "main": "baccarat-api.js",
+  "name": "baccarat-predictor",
+  "version": "4.0.0",
+  "description": "Baccarat Predictor v4 - @sewdangcap",
+  "main": "baccarat_bot.js",
   "scripts": {
-    "start": "node baccarat-api.js"
+    "start": "node baccarat_bot.js"
   },
   "dependencies": {
     "node-fetch": "^2.7.0"
   },
   "engines": {
-    "node": ">=18.0.0"
-  }
+    "node": ">=16.0.0"
+  },
+  "author": "@sewdangcap",
+  "license": "ISC"
 }
