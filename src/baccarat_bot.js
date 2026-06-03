@@ -404,6 +404,7 @@ async function fetchAndCache() {
 
       banList.push({
         ban:        ban,
+        phien:      newData ? (newData.phien ?? null) : null,
         du_doan:    a.dudoan,
         do_tin_cay: `${a.ti_le}%`,
       });
