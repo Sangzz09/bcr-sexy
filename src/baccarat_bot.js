@@ -1,16 +1,21 @@
 // ============================================
-// BACCARAT PREDICTOR v5 - @sewdangcap
-// Fix: Big Road chuẩn, fetch nhanh hơn, thuật toán cải thiện
-// node baccarat_bot.js
+// BACCARAT PREDICTOR v6 - @sewdangcap
+// Smart polling: phat hien phien moi → du doan ngay
+// Khong cho interval cung — fetch lien tuc, thong minh
 // ============================================
 
 const http  = require('http');
 const fetch = require('node-fetch');
 
-const API_OLD  = 'https://treasures-night-much-knowing.trycloudflare.com/api/bcr';
-const API_NEW  = 'https://nick-ingredients-leave-census.trycloudflare.com/api/bcr';
-const INTERVAL = 30000;
-const PORT     = process.env.PORT || 3000;
+const API_OLD     = 'https://treasures-night-much-knowing.trycloudflare.com/api/bcr';
+const API_NEW     = 'https://nick-ingredients-leave-census.trycloudflare.com/api/bcr';
+const PORT        = process.env.PORT || 3000;
+
+// --- Timing config ---
+const POLL_IDLE     = 3000;   // Poll moi 3s khi khong co gi moi
+const POLL_ACTIVE   = 800;    // Poll moi 800ms khi dang cho phien moi
+const POLL_SLOWDOWN = 2000;   // Poll moi 2s neu lien tuc empty > 20 lan
+const FETCH_TIMEOUT = 1800;   // Timeout moi request
 
 const BAN_IDS = [
   '1','2','3','4','5','6','7','8','9','10',
@@ -20,57 +25,50 @@ const BAN_IDS = [
 ];
 
 // ============================================
-// BIG ROAD — chuẩn: không giới hạn chiều cao,
-// chỉ wrap sang cột mới khi đổi side
+// STATE - theo doi phien cuoi cua tung ban
+// ============================================
+const lastPhien   = new Map(); // ban -> phien cuoi da xu ly
+const lastResults = new Map(); // ban -> results string cuoi
+
+// ============================================
+// BIG ROAD — chuan, khong gioi han chieu cao
 // ============================================
 function buildBigRoad(raw) {
-  const cols   = [];
-  let curSide  = null;
-  let curCol   = [];
+  const cols  = [];
+  let curSide = null;
+  let curCol  = [];
 
   for (const ch of raw) {
     if (ch === 'T') {
-      // Tie gắn vào ô cuối cùng của cột hiện tại
-      if (curCol.length > 0) {
-        curCol[curCol.length - 1] += 'T';
-      } else if (cols.length > 0) {
-        const lc = cols[cols.length - 1];
-        lc[lc.length - 1] += 'T';
-      }
+      if (curCol.length > 0) curCol[curCol.length - 1] += 'T';
+      else if (cols.length > 0) { const lc = cols[cols.length - 1]; lc[lc.length - 1] += 'T'; }
       continue;
     }
-
     if (ch !== curSide) {
-      // Đổi side → push cột cũ, mở cột mới
       if (curCol.length > 0) cols.push(curCol);
       curCol  = [ch];
       curSide = ch;
     } else {
-      // Cùng side → thêm vào cột hiện tại (không giới hạn chiều cao)
       curCol.push(ch);
     }
   }
-
   if (curCol.length > 0) cols.push(curCol);
   return cols;
 }
 
 // ============================================
-// DERIVED ROADS (Bead Plate offset=1, Small Road offset=2, Cockroach offset=3)
-// So sánh: cột hiện tại vs cột cách offset cột về trước
-// R = cùng pattern, B = khác pattern
+// DERIVED ROADS
 // ============================================
 function derivedRoad(cols, offset) {
   const result = [];
   for (let i = offset; i < cols.length; i++) {
-    const colCur  = cols[i];
-    const colRef  = cols[i - offset];
-    const maxRow  = Math.max(colCur.length, colRef.length);
+    const colCur = cols[i];
+    const colRef = cols[i - offset];
+    const maxRow = Math.max(colCur.length, colRef.length);
     for (let row = 0; row < maxRow; row++) {
       const a = colCur[row] ? colCur[row][0] : null;
       const b = colRef[row] ? colRef[row][0] : null;
       if (a === null && b === null) continue;
-      // Nếu một bên không có → khác (B)
       if (a === null || b === null) { result.push('B'); continue; }
       result.push(a === b ? 'R' : 'B');
     }
@@ -78,51 +76,37 @@ function derivedRoad(cols, offset) {
   return result;
 }
 
-// Dự đoán từ derived road: thử append B hoặc P, xem ô mới sinh ra là R hay B
-// → ưu tiên side nào làm derived road tiếp diễn (R)
 function predictFromDerived(cols, offset) {
   if (cols.length < offset + 1) return null;
-
   const lastCol  = cols[cols.length - 1];
-  const lastSide = lastCol[lastCol.length - 1][0]; // 'B' hoặc 'P'
+  const lastSide = lastCol[lastCol.length - 1][0];
 
   const tryAppend = (side) => {
-    // Clone cols sâu vừa đủ
     const newCols = cols.map(c => [...c]);
-    const lc      = newCols[newCols.length - 1];
-    if (side === lastSide) {
-      lc.push(side); // tiếp cột hiện tại
-    } else {
-      newCols.push([side]); // mở cột mới
-    }
+    const lc = newCols[newCols.length - 1];
+    if (side === lastSide) lc.push(side);
+    else newCols.push([side]);
     const road = derivedRoad(newCols, offset);
     return road.length > 0 ? road[road.length - 1] : null;
   };
 
   const ifB = tryAppend('B');
   const ifP = tryAppend('P');
-
-  // Nếu B → R và P → B: nên đặt B (tiếp diễn)
   if (ifB === 'R' && ifP === 'B') return 'B';
-  // Nếu P → R và B → B: nên đặt P (tiếp diễn)
   if (ifP === 'R' && ifB === 'B') return 'P';
 
-  // Cả hai đều R hoặc cả hai đều B → nhìn tail của road hiện tại
   const road = derivedRoad(cols, offset);
   if (road.length < 3) return null;
   const tail   = road.slice(-5);
   const rCount = tail.filter(x => x === 'R').length;
   const bCount = tail.filter(x => x === 'B').length;
-
-  // Xu hướng mạnh → tiếp diễn xu hướng đó
-  if (rCount >= 4) return lastSide;                            // đang chạy dài → tiếp
-  if (bCount >= 4) return lastSide === 'B' ? 'P' : 'B';      // đang đảo liên tục → đảo
+  if (rCount >= 4) return lastSide;
+  if (bCount >= 4) return lastSide === 'B' ? 'P' : 'B';
   return null;
 }
 
 // ============================================
-// BIG ROAD PATTERN DETECTION
-// Trả về { name, betSide: 'B'|'P'|null, weight }
+// BIG ROAD PATTERN
 // ============================================
 function detectBigRoadPattern(cols) {
   if (cols.length < 3) return { name: 'Chua ro cau', betSide: null, weight: 0 };
@@ -134,233 +118,153 @@ function detectBigRoadPattern(cols) {
   const curSide = lastCol[lastCol.length - 1][0];
   const oppSide = curSide === 'B' ? 'P' : 'B';
 
-  // Cầu dài (Streak) — tiếp diễn
-  if (curLen >= 5) return { name: `Cau dai x${curLen}`, betSide: curSide, weight: 2.5 };
-  if (curLen >= 3) return { name: `Cau x${curLen}`,     betSide: curSide, weight: 1.5 };
-
-  // Cầu 1 đôi — đảo liên tục
+  if (curLen >= 5) return { name: 'Cau dai x' + curLen, betSide: curSide,  weight: 2.5 };
+  if (curLen >= 3) return { name: 'Cau x'    + curLen,  betSide: curSide,  weight: 1.5 };
   if (lengths.every(x => x === 1)) return { name: 'Cau don', betSide: oppSide, weight: 2.5 };
-
-  // Cầu đôi — đảo sau 2
   if (lengths.every(x => x === 2)) return { name: 'Cau doi', betSide: oppSide, weight: 2.0 };
 
-  // Cầu 1-2 hoặc 2-1 (luân phiên)
-  const alt12 = lengths.every((x, i) => (i % 2 === 0 ? x === 1 : x === 2));
-  const alt21 = lengths.every((x, i) => (i % 2 === 0 ? x === 2 : x === 1));
+  const alt12 = lengths.length >= 4 && lengths.every((x, i) => (i % 2 === 0 ? x === 1 : x === 2));
+  const alt21 = lengths.length >= 4 && lengths.every((x, i) => (i % 2 === 0 ? x === 2 : x === 1));
   if (alt12 || alt21) {
-    // Xác định next expected
-    const nextLen = alt12
-      ? (cols.length % 2 === 0 ? 2 : 1)
-      : (cols.length % 2 === 0 ? 1 : 2);
-    const side = curLen < nextLen ? curSide : oppSide;
-    return { name: alt12 ? 'Cau 1-2' : 'Cau 2-1', betSide: side, weight: 2.0 };
+    const nextLen = alt12 ? (cols.length % 2 === 0 ? 2 : 1) : (cols.length % 2 === 0 ? 1 : 2);
+    return { name: alt12 ? 'Cau 1-2' : 'Cau 2-1', betSide: curLen < nextLen ? curSide : oppSide, weight: 2.0 };
   }
-
-  // Cầu 3
   if (lengths.every(x => x === 3)) return { name: 'Cau 3', betSide: oppSide, weight: 1.8 };
 
-  // Nghiêng về một bên (avg chiều cao cao)
   const avg = lengths.reduce((a, b) => a + b, 0) / lengths.length;
   if (avg >= 2.8) return { name: 'Nghieng', betSide: curSide, weight: 1.2 };
-
   return { name: 'Hon hop', betSide: null, weight: 0 };
 }
 
 // ============================================
-// RECENT RATIO (20 ván gần nhất, bỏ tie)
-// ============================================
-function recentRatio(nonTieArr) {
-  const r20  = nonTieArr.slice(-20);
-  const bCnt = r20.filter(x => x === 'B').length;
-  const pCnt = r20.filter(x => x === 'P').length;
-  const tot  = bCnt + pCnt || 1;
-  return { ratio: bCnt / tot, bCnt, pCnt };
-}
-
-// ============================================
-// SHOE POSITION BONUS
-// Đầu shoe (< 20 ván): theo xu hướng mạnh
-// Cuối shoe (> 55 ván): xu hướng càng rõ hơn
-// ============================================
-function shoeBonus(totalHands, ratio) {
-  let bB = 0, bP = 0;
-  if (totalHands < 20) {
-    if (ratio > 0.65) bB += 0.8;
-    else if (ratio < 0.35) bP += 0.8;
-  }
-  if (totalHands > 55) {
-    if (ratio > 0.58) bB += 1.2;
-    else if (ratio < 0.42) bP += 1.2;
-  }
-  return { bB, bP };
-}
-
-// ============================================
-// TIE CYCLE — kiểm tra xem tie có chu kỳ đều không
+// TIE CYCLE
 // ============================================
 function checkTieCycle(raw) {
   const tPos = [];
   [...raw].forEach((x, i) => { if (x === 'T') tPos.push(i); });
   if (tPos.length < 3) return false;
-
   const gaps    = [];
   for (let i = 1; i < tPos.length; i++) gaps.push(tPos[i] - tPos[i - 1]);
   const avgGap  = gaps.reduce((a, b) => a + b, 0) / gaps.length;
   const variance = gaps.reduce((a, b) => a + (b - avgGap) ** 2, 0) / gaps.length;
-
-  // Chu kỳ đều (variance thấp) và khoảng cách hợp lý
   if (variance > 4 || avgGap < 4 || avgGap > 16) return false;
-
-  const distFromLast = raw.length - 1 - tPos[tPos.length - 1];
-  return Math.abs(distFromLast - avgGap) <= 2;
+  return Math.abs((raw.length - 1 - tPos[tPos.length - 1]) - avgGap) <= 2;
 }
 
 // ============================================
-// NORMALIZE confidence về dải 55–88%
-// Tránh over-confident (không bao giờ báo 99%)
+// NORMALIZE -> dai 55-88%
 // ============================================
 function normalize(rawScore) {
   const clamped = Math.max(50, Math.min(95, rawScore));
-  // Map [50, 95] → [55, 88]
-  const mapped  = 55 + ((clamped - 50) / 45) * 33;
-  return Math.round(mapped);
+  return Math.round(55 + ((clamped - 50) / 45) * 33);
 }
 
 // ============================================
-// ANALYZE — ghép voting từ tất cả signals
+// ANALYZE
 // ============================================
 function analyze(oldData, newData) {
-  // Scores: dương = B, âm = P
   let scoreB = 0, scoreP = 0;
   let beb = null, sr = null, cr = null;
   let cols = [];
-  let nonTieArr = [];
 
-  // ---------- SOURCE 1: API cũ (chuỗi kết quả) ----------
   const raw = oldData
     ? (oldData.results || '').toUpperCase().replace(/[^BPT]/g, '')
     : '';
 
   if (raw.length >= 8) {
-    cols       = buildBigRoad(raw);
-    nonTieArr  = [...raw].filter(x => x !== 'T');
+    cols = buildBigRoad(raw);
+    const nonTie = [...raw].filter(x => x !== 'T');
 
     if (cols.length >= 3) {
-      const lastCol  = cols[cols.length - 1];
-      const curSide  = lastCol[lastCol.length - 1][0];
+      beb = predictFromDerived(cols, 1);
+      sr  = predictFromDerived(cols, 2);
+      cr  = predictFromDerived(cols, 3);
+      if (beb === 'B') scoreB += 2.5; else if (beb === 'P') scoreP += 2.5;
+      if (sr  === 'B') scoreB += 2.0; else if (sr  === 'P') scoreP += 2.0;
+      if (cr  === 'B') scoreB += 1.5; else if (cr  === 'P') scoreP += 1.5;
 
-      // --- Derived roads (trọng số cao nhất) ---
-      beb = predictFromDerived(cols, 1); // Bead plate
-      sr  = predictFromDerived(cols, 2); // Small road
-      cr  = predictFromDerived(cols, 3); // Cockroach road
+      const pat = detectBigRoadPattern(cols);
+      if (pat.betSide === 'B') scoreB += pat.weight;
+      else if (pat.betSide === 'P') scoreP += pat.weight;
 
-      const drWeights = { beb: 2.5, sr: 2.0, cr: 1.5 };
-      if (beb === 'B') scoreB += drWeights.beb; else if (beb === 'P') scoreP += drWeights.beb;
-      if (sr  === 'B') scoreB += drWeights.sr;  else if (sr  === 'P') scoreP += drWeights.sr;
-      if (cr  === 'B') scoreB += drWeights.cr;  else if (cr  === 'P') scoreP += drWeights.cr;
-
-      // --- Big Road pattern ---
-      const pattern = detectBigRoadPattern(cols);
-      if (pattern.betSide === 'B') scoreB += pattern.weight;
-      else if (pattern.betSide === 'P') scoreP += pattern.weight;
-
-      // --- Recent ratio ---
-      const { ratio } = recentRatio(nonTieArr);
+      const r20  = nonTie.slice(-20);
+      const r20B = r20.filter(x => x === 'B').length;
+      const r20P = r20.filter(x => x === 'P').length;
+      const ratio = r20B / (r20B + r20P || 1);
       if (ratio > 0.62) scoreB += 1.2;
       else if (ratio < 0.38) scoreP += 1.2;
       else if (ratio > 0.55) scoreB += 0.5;
       else if (ratio < 0.45) scoreP += 0.5;
 
-      // --- Shoe position ---
-      const shoe = shoeBonus(nonTieArr.length, ratio);
-      scoreB += shoe.bB;
-      scoreP += shoe.bP;
+      const n = nonTie.length;
+      if (n < 20  && ratio > 0.65) scoreB += 0.8;
+      if (n < 20  && ratio < 0.35) scoreP += 0.8;
+      if (n > 55  && ratio > 0.58) scoreB += 1.2;
+      if (n > 55  && ratio < 0.42) scoreP += 1.2;
 
-      // --- Tie cycle ---
-      if (checkTieCycle(raw)) {
-        // Nếu dự đoán tie mạnh, trả luôn
-        const tieConf = normalize(70);
-        return { dudoan: 'Hòa', ti_le: tieConf };
-      }
+      if (checkTieCycle(raw)) return { dudoan: 'Hoa', ti_le: normalize(70) };
 
-      // --- good_road hint từ API cũ ---
       const gr = (oldData.good_road || '').toString().toLowerCase();
-      if (gr.includes('cái') || gr.includes('banker')) scoreB += 1.0;
+      if (gr.includes('cai') || gr.includes('banker')) scoreB += 1.0;
       if (gr.includes('con') || gr.includes('player')) scoreP += 1.0;
     }
   }
 
-  // ---------- SOURCE 2: API mới (stats) ----------
   if (newData) {
-    const last5   = newData.last_5   || [];
-    const stats   = newData.stats_55 || {};
-    const recBet  = (newData.recommended_bet || '').toUpperCase();
-    const betInfo = newData.bet_info || [];
-
-    // Last 5 kết quả
-    const l5results = last5.map(x => {
+    const last5 = (newData.last_5 || []).map(x => {
       const w = (x.winner || '').toLowerCase();
-      if (w === 'banker') return 'B';
-      if (w === 'player') return 'P';
-      return 'T';
+      return w === 'banker' ? 'B' : w === 'player' ? 'P' : 'T';
     }).filter(x => x !== 'T');
 
-    const l5B = l5results.filter(x => x === 'B').length;
-    const l5P = l5results.filter(x => x === 'P').length;
-    // Trọng số thấp hơn vì chỉ 5 ván
+    const l5B = last5.filter(x => x === 'B').length;
+    const l5P = last5.filter(x => x === 'P').length;
     if (l5B > l5P) scoreB += (l5B - l5P) * 0.4;
     else if (l5P > l5B) scoreP += (l5P - l5B) * 0.4;
 
-    // Stats 55 ván
+    const stats   = newData.stats_55 || {};
     const total55 = (stats.banker || 0) + (stats.player || 0);
     if (total55 > 10) {
-      const ratio55 = (stats.banker || 0) / total55;
-      if (ratio55 > 0.60) scoreB += 1.0;
-      else if (ratio55 < 0.40) scoreP += 1.0;
-      else if (ratio55 > 0.53) scoreB += 0.4;
-      else if (ratio55 < 0.47) scoreP += 0.4;
+      const r55 = (stats.banker || 0) / total55;
+      if (r55 > 0.60) scoreB += 1.0;
+      else if (r55 < 0.40) scoreP += 1.0;
+      else if (r55 > 0.53) scoreB += 0.4;
+      else if (r55 < 0.47) scoreP += 0.4;
     }
 
-    // Recommended bet từ API mới
+    const recBet = (newData.recommended_bet || '').toUpperCase();
     if (recBet.includes('BANKER')) scoreB += 1.5;
     else if (recBet.includes('PLAYER')) scoreP += 1.5;
 
-    // Crowd bet ratio (tỷ lệ tiền đặt thực tế)
-    const bkBet = betInfo.find(x => x.type === 'Banker');
-    const plBet = betInfo.find(x => x.type === 'Player');
+    const bkBet = (newData.bet_info || []).find(x => x.type === 'Banker');
+    const plBet = (newData.bet_info || []).find(x => x.type === 'Player');
     if (bkBet && plBet) {
-      const totalAmt = (bkBet.amount || 0) + (plBet.amount || 0);
-      if (totalAmt > 0) {
-        const crowdRatio = bkBet.amount / totalAmt;
-        if (crowdRatio > 0.68) scoreB += 0.8;
-        else if (crowdRatio < 0.32) scoreP += 0.8;
+      const tot = (bkBet.amount || 0) + (plBet.amount || 0);
+      if (tot > 0) {
+        const cr2 = bkBet.amount / tot;
+        if (cr2 > 0.68) scoreB += 0.8;
+        else if (cr2 < 0.32) scoreP += 0.8;
       }
     }
   }
 
   if (scoreB === 0 && scoreP === 0) return { dudoan: 'Chua du du lieu', ti_le: 0 };
 
-  // ---------- Quyết định ----------
-  const pred   = scoreB >= scoreP ? 'B' : 'P';
-  const total  = scoreB + scoreP + 0.01;
-  let rawScore = (Math.max(scoreB, scoreP) / total) * 100;
-
-  // Bonus nếu derived roads đồng thuận
+  const pred    = scoreB >= scoreP ? 'B' : 'P';
+  const total   = scoreB + scoreP + 0.01;
+  let rawScore  = (Math.max(scoreB, scoreP) / total) * 100;
   const drAgree = [beb, sr, cr].filter(x => x === pred).length;
   if (drAgree === 3) rawScore += 10;
   else if (drAgree === 2) rawScore += 5;
 
-  const tenViet = { B: 'Cái', P: 'Con' };
-  return { dudoan: tenViet[pred], ti_le: normalize(rawScore) };
+  return { dudoan: pred === 'B' ? 'Cai' : 'Con', ti_le: normalize(rawScore) };
 }
 
 // ============================================
-// FETCH — timeout ngắn, không retry ngầm,
-// dùng Promise.allSettled để không bị chặn bởi 1 API chết
+// FETCH
 // ============================================
-async function safeFetch(url, timeout = 2000) {
+async function safeFetch(url) {
   const controller = new AbortController();
-  const timer      = setTimeout(() => controller.abort(), timeout);
+  const timer      = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
@@ -376,33 +280,32 @@ async function safeFetch(url, timeout = 2000) {
 }
 
 // ============================================
-// CACHE
+// CACHE & STATS
 // ============================================
-let cache     = null;
-let lastFetch = 0;
-let isFetching = false;
+let cache       = null;
+let lastFetch   = 0;
+let isFetching  = false;
+let fetchCount  = 0;
+let updateCount = 0;
 
+// ============================================
+// FETCH & DETECT NEW PHIEN
+// Tra ve: true neu co phien moi
+// ============================================
 async function fetchAndCache() {
-  if (isFetching) return; // chống fetch chồng nhau
-  isFetching = true;
+  if (isFetching) return false;
+  isFetching  = true;
+  fetchCount++;
+  let hasNew  = false;
 
   try {
-    // Tất cả fetch chạy SONG SONG, dùng allSettled nên 1 cái timeout
-    // không block cái khác
-    const allUrls = [
-      API_OLD,
-      ...BAN_IDS.map(id => `${API_NEW}/${id}`),
-    ];
+    const [oldResult, ...newResults] = await Promise.allSettled([
+      safeFetch(API_OLD),
+      ...BAN_IDS.map(id => safeFetch(API_NEW + '/' + id)),
+    ]);
 
-    const results = await Promise.allSettled(
-      allUrls.map(url => safeFetch(url, 2000))
-    );
+    const oldJson = oldResult.status === 'fulfilled' ? oldResult.value : null;
 
-    // Kết quả đầu tiên là API_OLD
-    const oldJson    = results[0].status === 'fulfilled' ? results[0].value : null;
-    const newResults = results.slice(1).map(r => r.status === 'fulfilled' ? r.value : null);
-
-    // Build map từ API cũ
     const oldMap = {};
     if (oldJson && oldJson.code === 200 && Array.isArray(oldJson.data)) {
       for (const item of oldJson.data) {
@@ -410,37 +313,57 @@ async function fetchAndCache() {
       }
     }
 
-    // Build map từ API mới
     const newMap = {};
     for (let i = 0; i < BAN_IDS.length; i++) {
-      const d = newResults[i];
+      const d = newResults[i] && newResults[i].status === 'fulfilled' ? newResults[i].value : null;
       if (!d) continue;
       const key = d.table ? String(d.table).trim() : BAN_IDS[i];
       newMap[key] = d;
     }
 
-    const allBans = new Set([...Object.keys(oldMap), ...Object.keys(newMap)]);
-    const banList = [];
+    const allBans  = new Set([...Object.keys(oldMap), ...Object.keys(newMap)]);
+    const banList  = cache ? [...cache] : [];
+    const banIndex = {};
+    banList.forEach((b, i) => { banIndex[b.ban] = i; });
 
     for (const ban of allBans) {
       const oldData = oldMap[ban] || null;
       const newData = newMap[ban] || null;
       if (!oldData && !newData) continue;
 
-      // Bỏ qua bàn không có đủ dữ liệu
+      const curPhien   = newData ? (newData.phien != null ? newData.phien : null) : null;
+      const curResults = oldData ? (oldData.results || null) : null;
+
+      const phienChanged   = curPhien   !== null && curPhien   !== lastPhien.get(ban);
+      const resultsChanged = curResults !== null && curResults !== lastResults.get(ban);
+
+      if (!phienChanged && !resultsChanged) continue;
+
+      if (phienChanged)   lastPhien.set(ban, curPhien);
+      if (resultsChanged) lastResults.set(ban, curResults);
+      hasNew = true;
+
       const hasNewData = newData && newData.last_5 && newData.last_5.length > 0;
-      const hasOldData = oldData && (oldData.results || '').length >= 8;
+      const hasOldData = (oldData && (oldData.results || '').length >= 8);
       if (!hasNewData && !hasOldData) continue;
 
       const a = analyze(oldData, newData);
       if (a.ti_le === 0) continue;
 
-      banList.push({
-        ban:        ban,
-        phien:      newData ? (newData.phien ?? null) : null,
+      const entry = {
+        ban,
+        phien:      curPhien,
         du_doan:    a.dudoan,
-        do_tin_cay: `${a.ti_le}%`,
-      });
+        do_tin_cay: a.ti_le + '%',
+        updated_at: Date.now(),
+      };
+
+      if (ban in banIndex) {
+        banList[banIndex[ban]] = entry;
+      } else {
+        banIndex[ban] = banList.length;
+        banList.push(entry);
+      }
     }
 
     banList.sort((a, b) =>
@@ -450,25 +373,49 @@ async function fetchAndCache() {
     cache     = banList;
     lastFetch = Date.now();
 
-    const ts = new Date(lastFetch).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-    console.log(`[${ts}] Cap nhat ${cache.length} ban | old: ${Object.keys(oldMap).length} | new: ${Object.keys(newMap).length}`);
+    if (hasNew) {
+      updateCount++;
+      const ts = new Date(lastFetch).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      console.log('[' + ts + '] [PHIEN MOI #' + updateCount + '] ' + cache.length + ' ban | fetch #' + fetchCount);
+    }
   } catch (err) {
     console.error('fetchAndCache error:', err.message);
   } finally {
     isFetching = false;
   }
+
+  return hasNew;
 }
 
 // ============================================
-// LOOP — bắt đầu fetch kế tiếp ngay sau khi xong,
-// trừ đi thời gian đã dùng → không bao giờ drift
+// SMART POLLING LOOP
+//
+// - Khi khong co phien moi: poll moi POLL_ACTIVE (800ms)
+//   de bat phien moi ngay khi xuat hien
+// - Sau khi co phien moi: cho POLL_IDLE (3s) roi tiep tuc active
+// - Neu lien tuc empty > 20 lan: tang len POLL_SLOWDOWN (2s) tranh spam
 // ============================================
-async function loop() {
-  const t0 = Date.now();
-  await fetchAndCache();
+let consecutiveEmpty = 0;
+
+async function smartLoop() {
+  const t0     = Date.now();
+  const hadNew = await fetchAndCache();
   const elapsed = Date.now() - t0;
-  const wait    = Math.max(1000, INTERVAL - elapsed);
-  setTimeout(loop, wait);
+
+  let wait;
+  if (hadNew) {
+    consecutiveEmpty = 0;
+    wait = Math.max(0, POLL_IDLE - elapsed);
+  } else {
+    consecutiveEmpty++;
+    if (consecutiveEmpty > 20) {
+      wait = Math.max(0, POLL_SLOWDOWN - elapsed);
+    } else {
+      wait = Math.max(0, POLL_ACTIVE - elapsed);
+    }
+  }
+
+  setTimeout(smartLoop, wait);
 }
 
 // ============================================
@@ -477,14 +424,15 @@ async function loop() {
 function sendJSON(res, status, data) {
   const body = JSON.stringify(data, null, 2);
   res.writeHead(status, {
-    'Content-Type':                 'application/json; charset=utf-8',
-    'Content-Length':               Buffer.byteLength(body),
-    'Access-Control-Allow-Origin':  '*',
+    'Content-Type':                'application/json; charset=utf-8',
+    'Content-Length':              Buffer.byteLength(body),
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control':               'no-cache',
   });
   res.end(body);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(function(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, { 'Access-Control-Allow-Origin': '*' });
     return res.end();
@@ -492,7 +440,6 @@ const server = http.createServer((req, res) => {
 
   const url = req.url.split('?')[0];
 
-  // GET /api/bcr — toàn bộ bàn
   if (req.method === 'GET' && url === '/api/bcr') {
     if (!cache) return sendJSON(res, 503, { loi: 'Chua co du lieu, thu lai sau' });
     return sendJSON(res, 200, {
@@ -503,37 +450,44 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  // GET /api/bcr/:ban — một bàn cụ thể
   const match = url.match(/^\/api\/bcr\/(.+)$/);
   if (req.method === 'GET' && match) {
     if (!cache) return sendJSON(res, 503, { loi: 'Chua co du lieu, thu lai sau' });
     const banId = decodeURIComponent(match[1]).trim();
-    const item  = cache.find(x => String(x.ban).trim() === banId);
-    if (!item)  return sendJSON(res, 404, { loi: `Khong tim thay ban: ${banId}` });
-    return sendJSON(res, 200, {
+    const item  = cache.find(function(x) { return String(x.ban).trim() === banId; });
+    if (!item)  return sendJSON(res, 404, { loi: 'Khong tim thay ban: ' + banId });
+    return sendJSON(res, 200, Object.assign({
       id:       '@sewdangcap',
       cap_nhat: new Date(lastFetch).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
-      ...item,
-    });
+    }, item));
   }
 
-  // GET /health
   if (req.method === 'GET' && url === '/health') {
     return sendJSON(res, 200, {
-      status:   'ok',
-      cache:    cache ? cache.length : 0,
-      fetching: isFetching,
+      status:            'ok',
+      cache_size:        cache ? cache.length : 0,
+      fetching:          isFetching,
+      fetch_count:       fetchCount,
+      update_count:      updateCount,
+      consecutive_empty: consecutiveEmpty,
       last_fetch_ago_ms: Date.now() - lastFetch,
+      poll_mode:         consecutiveEmpty > 20 ? 'slowdown_2s' : consecutiveEmpty > 0 ? 'active_800ms' : 'just_updated',
     });
   }
 
   sendJSON(res, 404, { loi: 'Route khong ton tai' });
 });
 
-server.listen(PORT, () => {
-  console.log(`Server chay tai http://localhost:${PORT}`);
-  console.log(`  GET /api/bcr        -> toan bo ban`);
-  console.log(`  GET /api/bcr/:ban   -> mot ban cu the`);
-  console.log(`  GET /health         -> trang thai server`);
-  loop(); // bắt đầu vòng lặp fetch
+server.listen(PORT, function() {
+  console.log('\n=== BACCARAT BOT v6 - Smart Polling ===');
+  console.log('Server: http://localhost:' + PORT);
+  console.log('Poll active  : ' + POLL_ACTIVE  + 'ms (cho phien moi)');
+  console.log('Poll idle    : ' + POLL_IDLE    + 'ms (sau phien moi)');
+  console.log('Poll slowdown: ' + POLL_SLOWDOWN + 'ms (khi khong co gi lau)');
+  console.log('Fetch timeout: ' + FETCH_TIMEOUT + 'ms');
+  console.log('Routes:');
+  console.log('  GET /api/bcr        -> toan bo ban');
+  console.log('  GET /api/bcr/:ban   -> mot ban cu the');
+  console.log('  GET /health         -> trang thai poll\n');
+  smartLoop();
 });
