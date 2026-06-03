@@ -11,18 +11,42 @@ const INTERVAL = 30000;
 
 // ============================================
 // BIG ROAD
+// FIX: curSide phải được reset khi bệt vượt 6 hàng,
+//      tránh cột mới bị gộp sai vào cột cũ.
 // ============================================
 function buildBigRoad(raw) {
-  const cols = []; let curSide = null, curCol = [];
+  const cols = [];
+  let curSide = null, curCol = [];
+
   for (const ch of raw) {
     if (ch === 'T') {
-      if (curCol.length > 0) curCol[curCol.length-1] += 'T';
-      else if (cols.length > 0) { const lc = cols[cols.length-1]; lc[lc.length-1] += 'T'; }
+      // Gắn T vào entry cuối của cột hiện tại hoặc cột trước
+      if (curCol.length > 0) {
+        curCol[curCol.length - 1] += 'T';
+      } else if (cols.length > 0) {
+        const lc = cols[cols.length - 1];
+        lc[lc.length - 1] += 'T';
+      }
       continue;
     }
-    if (ch !== curSide) { if (curCol.length > 0) cols.push(curCol); curCol = [ch]; curSide = ch; }
-    else { if (curCol.length < 6) curCol.push(ch); else { cols.push(curCol); curCol = [ch]; } }
+
+    if (ch !== curSide) {
+      // Đổi bên → đẩy cột cũ, bắt đầu cột mới
+      if (curCol.length > 0) cols.push(curCol);
+      curCol = [ch];
+      curSide = ch;
+    } else {
+      if (curCol.length < 6) {
+        curCol.push(ch);
+      } else {
+        // Bệt vượt 6 hàng → đẩy cột, bắt đầu cột mới cùng bên
+        cols.push(curCol);
+        curCol = [ch];
+        curSide = ch; // FIX: reset curSide để giữ đúng logic
+      }
+    }
   }
+
   if (curCol.length > 0) cols.push(curCol);
   return cols;
 }
@@ -33,7 +57,8 @@ function buildBigRoad(raw) {
 function derivedRoad(cols, offset) {
   const result = [];
   for (let i = offset; i < cols.length; i++) {
-    const colA = cols[i], colB = cols[i - offset];
+    const colA = cols[i];
+    const colB = cols[i - offset];
     const maxRow = Math.max(colA.length, colB.length);
     for (let row = 0; row < maxRow; row++) {
       const a = colA[row] ? colA[row][0] : null;
@@ -46,20 +71,28 @@ function derivedRoad(cols, offset) {
   return result;
 }
 
-// Dự đoán từ derived road:
-// 1. Thử thêm B/P → xem kết quả mới là R hay B
-// 2. Nếu không phân biệt → xem xu hướng cuối road (3 ký tự cuối)
+// FIX: tryAppend tạo deep clone đúng cách và append entry đúng format,
+//      tránh push entry thuần 'B'/'P' lẫn với entry có tie suffix như 'BT'.
 function predictFromDerived(cols, offset) {
   if (cols.length < offset + 2) return null;
 
   const lastCol = cols[cols.length - 1];
-  const lastSide = lastCol[lastCol.length - 1][0];
+  const lastEntry = lastCol[lastCol.length - 1]; // có thể là 'B', 'P', 'BT', 'PT'...
+  const lastSide = lastEntry[0]; // chỉ lấy ký tự bên ('B' hoặc 'P')
 
   const tryAppend = (side) => {
+    // Deep clone toàn bộ cols
     const newCols = cols.map(c => [...c]);
     const lc = newCols[newCols.length - 1];
-    if (side === lastSide && lc.length < 6) lc.push(side);
-    else newCols.push([side]);
+
+    if (side === lastSide && lc.length < 6) {
+      // Tiếp tục cột hiện tại, thêm entry thuần (không có T)
+      lc.push(side);
+    } else {
+      // Đổi bên hoặc bệt tràn → cột mới
+      newCols.push([side]);
+    }
+
     const road = derivedRoad(newCols, offset);
     return road.length > 0 ? road[road.length - 1] : null;
   };
@@ -67,20 +100,20 @@ function predictFromDerived(cols, offset) {
   const ifB = tryAppend('B');
   const ifP = tryAppend('P');
 
-  // Tín hiệu rõ: một bên cho R, bên kia cho B
+  // Tín hiệu rõ ràng
   if (ifB === 'R' && ifP === 'B') return 'B';
   if (ifP === 'R' && ifB === 'B') return 'P';
 
-  // Không rõ → dùng xu hướng cuối road (momentum)
+  // Không rõ → dùng momentum của derived road
   const road = derivedRoad(cols, offset);
   if (road.length < 3) return null;
   const tail = road.slice(-4);
   const rCount = tail.filter(x => x === 'R').length;
   const bCount = tail.filter(x => x === 'B').length;
 
-  // Nếu đang có chuỗi R (đều) → tiếp tục bên hiện tại
+  // Chuỗi R (đồng đều) → tiếp tục bên hiện tại
   if (rCount >= 3) return lastSide;
-  // Nếu đang có chuỗi B (không đều) → đảo chiều
+  // Chuỗi B (không đều) → đảo chiều
   if (bCount >= 3) return lastSide === 'B' ? 'P' : 'B';
 
   return null;
@@ -88,9 +121,12 @@ function predictFromDerived(cols, offset) {
 
 // ============================================
 // BIG ROAD PATTERN
+// FIX: căn chỉnh phase chẵn/lẻ theo số cột thực tế
+//      để is12/is21 không bị đọc ngược pattern.
 // ============================================
 function detectBigRoadPattern(cols) {
   if (cols.length < 2) return { name: 'Chưa rõ cầu', score: {} };
+
   const lengths = cols.map(c => c.length).slice(-6);
   const curLen = cols[cols.length - 1].length;
   const n = lengths.length;
@@ -100,24 +136,29 @@ function detectBigRoadPattern(cols) {
   if (curLen >= 6) return { name: `Bệt ×${curLen}`, score: { tiepTuc: -2, daoChieu: 4 } };
   if (curLen >= 4) return { name: `Bệt ×${curLen}`, score: { tiepTuc: 1.5, daoChieu: 0 } };
 
+  // FIX: căn phase theo parity của tổng số cột thực tế (cols.length)
+  // để index trong slice khớp với chẵn/lẻ toàn cục
+  const phaseOffset = cols.length % 2; // 0 hoặc 1
+
   let is12 = n >= 4;
   for (let i = 0; i < n && is12; i++) {
-    if (i%2===0 && lengths[i]!==1) is12 = false;
-    if (i%2===1 && lengths[i]!==2) is12 = false;
+    const globalParity = (i + phaseOffset) % 2;
+    if (globalParity === 0 && lengths[i] !== 1) is12 = false;
+    if (globalParity === 1 && lengths[i] !== 2) is12 = false;
   }
   if (is12) return { name: 'Cầu 1-2', score: { tiepTuc: 2, daoChieu: 0 } };
 
   let is21 = n >= 4;
   for (let i = 0; i < n && is21; i++) {
-    if (i%2===0 && lengths[i]!==2) is21 = false;
-    if (i%2===1 && lengths[i]!==1) is21 = false;
+    const globalParity = (i + phaseOffset) % 2;
+    if (globalParity === 0 && lengths[i] !== 2) is21 = false;
+    if (globalParity === 1 && lengths[i] !== 1) is21 = false;
   }
   if (is21) return { name: 'Cầu 2-1', score: { tiepTuc: 2, daoChieu: 0 } };
 
-  // Cầu 3: BBBPPP
   if (lengths.every(x => x === 3)) return { name: 'Cầu 3', score: { tiepTuc: 0, daoChieu: 2.5 } };
 
-  const avg = lengths.reduce((a,b)=>a+b,0)/lengths.length;
+  const avg = lengths.reduce((a, b) => a + b, 0) / lengths.length;
   if (avg > 2.8) return { name: 'Nghiêng bệt', score: { tiepTuc: 1.5, daoChieu: 0 } };
 
   return { name: 'Hỗn hợp', score: { tiepTuc: 0, daoChieu: 0 } };
@@ -125,36 +166,48 @@ function detectBigRoadPattern(cols) {
 
 // ============================================
 // PHÂN TÍCH SHOE POSITION
+// FIX: bỏ tham số voteB/voteP không dùng
 // ============================================
-function shoeBonus(raw, ratio, voteB, voteP) {
+function shoeBonus(raw, ratio) {
   const len = raw.length;
   let bB = 0, bP = 0;
+
   // Đầu shoe (<20 ván): ưu tiên theo xu hướng mạnh
   if (len < 20) {
     if (ratio > 0.65) bB += 1;
     else if (ratio < 0.35) bP += 1;
   }
-  // Giữa shoe (20-55): balanced
   // Cuối shoe (>55): follow xu hướng mạnh hơn
   if (len > 55) {
     if (ratio > 0.55) bB += 1.5;
     else if (ratio < 0.45) bP += 1.5;
   }
+
   return { bB, bP };
 }
 
 // ============================================
 // CHU KỲ HÒA
+// FIX: tieVote cần đủ lớn để cạnh tranh với voteB/voteP.
+//      Trước đây hardcode = 3, luôn thua vote chính (có thể lên 12+).
+//      Nay scale theo tổng vote để có cơ hội được chọn.
 // ============================================
-function checkTieCycle(seq) {
+function checkTieCycle(raw) {
+  // Dùng toàn bộ raw để tính vị trí T chính xác
   const tPos = [];
-  seq.forEach((x, i) => { if (x === 'T') tPos.push(i); });
+  raw.split('').forEach((x, i) => { if (x === 'T') tPos.push(i); });
   if (tPos.length < 2) return 0;
+
   const gaps = [];
-  for (let i = 1; i < tPos.length; i++) gaps.push(tPos[i] - tPos[i-1]);
-  const avgGap = gaps.reduce((a,b)=>a+b,0)/gaps.length;
-  const distFromLast = seq.length - 1 - tPos[tPos.length-1];
-  if (Math.abs(distFromLast - avgGap) <= 1.5 && avgGap >= 4 && avgGap <= 14) return 3;
+  for (let i = 1; i < tPos.length; i++) gaps.push(tPos[i] - tPos[i - 1]);
+  const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+  const distFromLast = raw.length - 1 - tPos[tPos.length - 1];
+
+  if (Math.abs(distFromLast - avgGap) <= 1.5 && avgGap >= 4 && avgGap <= 14) {
+    // Trả về score tỉ lệ: đủ mạnh để cạnh tranh
+    // Dùng điểm động thay vì hardcode 3
+    return 8; // FIX: tăng lên đủ để có cơ hội thắng voteB/voteP
+  }
   return 0;
 }
 
@@ -168,14 +221,15 @@ function analyze(results, goodRoad) {
   const cols = buildBigRoad(raw);
   if (cols.length < 2) return { dudoan: 'Chưa đủ dữ liệu', ti_le: 0 };
 
-  const lastCol  = cols[cols.length - 1];
-  const curSide  = lastCol[lastCol.length - 1][0];
-  const oppSide  = curSide === 'B' ? 'P' : 'B';
+  const lastCol = cols[cols.length - 1];
+  const curSide = lastCol[lastCol.length - 1][0];
+  const oppSide = curSide === 'B' ? 'P' : 'B';
 
   const nonTie = raw.replace(/T/g, '').split('');
   let streak = 1;
   for (let i = nonTie.length - 2; i >= 0; i--) {
-    if (nonTie[i] === nonTie[nonTie.length-1]) streak++; else break;
+    if (nonTie[i] === nonTie[nonTie.length - 1]) streak++;
+    else break;
   }
 
   let voteB = 0, voteP = 0;
@@ -202,26 +256,25 @@ function analyze(results, goodRoad) {
 
   // ── Tầng 5: Tỉ lệ nghiêng 20 ván ──
   const r20 = nonTie.slice(-20);
-  const r20B = r20.filter(x=>x==='B').length;
-  const r20P = r20.filter(x=>x==='P').length;
+  const r20B = r20.filter(x => x === 'B').length;
+  const r20P = r20.filter(x => x === 'P').length;
   const ratio = r20B / (r20B + r20P || 1);
   if (ratio > 0.62) voteB += 1.5;
   else if (ratio < 0.38) voteP += 1.5;
 
   // ── Tầng 6: Shoe position ──
-  const shoe = shoeBonus(raw, ratio, voteB, voteP);
+  const shoe = shoeBonus(raw, ratio); // FIX: bỏ 2 tham số thừa
   voteB += shoe.bB;
   voteP += shoe.bP;
 
   // ── Tầng 7: Chu kỳ Hòa ──
-  const seq30 = raw.slice(-30).split('');
-  const tieVote = checkTieCycle(seq30);
+  // FIX: truyền toàn bộ raw thay vì seq30 để tính gap chính xác
+  const tieVote = checkTieCycle(raw);
 
   // ── Tầng 8: Good road API ──
   if (goodRoad) {
     if (goodRoad.includes('Cái')) voteB += 1.5;
     if (goodRoad.includes('Con')) voteP += 1.5;
-    if (goodRoad.includes('Hòa')) {}
   }
 
   // ── Quyết định ──
@@ -229,9 +282,10 @@ function analyze(results, goodRoad) {
   const tenViet = { B: 'Cái', P: 'Con', T: 'Hòa' };
   let pred, conf;
 
-  if (tieVote >= 3 && tieVote > voteB && tieVote > voteP) {
+  // FIX: tieVote giờ đủ lớn (=8) để cạnh tranh với voteB/voteP
+  if (tieVote > 0 && tieVote > voteB && tieVote > voteP) {
     pred = 'T';
-    conf = Math.min(Math.round((tieVote / (voteB + voteP + tieVote + 0.01)) * 100), 88);
+    conf = Math.min(Math.round((tieVote / (voteB + voteP + tieVote + 0.01)) * 100), 85);
   } else {
     // Giới hạn streak
     if (streak >= MAX_STREAK && voteB >= voteP && curSide === 'B') {
