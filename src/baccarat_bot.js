@@ -7,7 +7,7 @@
 const http  = require('http');
 const fetch = require('node-fetch');
 
-const API_OLD     = 'https://treasures-night-much-knowing.trycloudflare.com/api/bcr';
+const API_OLD     = 'https://rarely-walk-dimension-routers.trycloudflare.com/api/bcr';
 const API_NEW     = 'https://nick-ingredients-leave-census.trycloudflare.com/api/bcr';
 const PORT        = process.env.PORT || 3000;
 
